@@ -7,6 +7,7 @@ import argparse
 import curses
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -14,13 +15,16 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 from typing import Any, Sequence
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_REFRESH = 1.0
 DEFAULT_PREVIEW_LINES = 80
+POLL_TIMEOUT = 4.0
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+INLINE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 ANSI_RE = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[()][0-2A-Z])"
 )
@@ -36,27 +40,52 @@ class BackendError(RuntimeError):
         self.exit_code = exit_code
 
 
+def _tb_command(candidate: Path) -> list[str] | None:
+    if candidate.is_dir():
+        candidate = candidate / "tb.py"
+    if not candidate.is_file():
+        return None
+    if candidate.suffix == ".py":
+        return [sys.executable, str(candidate)]
+    if os.access(candidate, os.X_OK):
+        return [str(candidate)]
+    return None
+
+
+def _required_tb(value: str, source: str) -> list[str]:
+    candidate = Path(value).expanduser()
+    if command := _tb_command(candidate):
+        return command
+    if len(candidate.parts) == 1:
+        if installed := shutil.which(value):
+            return [installed]
+    raise BackendError(
+        f"{source} does not name a runnable tmux-cli entrypoint: {value}",
+        code="ENOCLI",
+    )
+
+
 def discover_tb(explicit: str | None = None) -> list[str]:
-    """Return the command prefix for the selected tmux-cli entrypoint."""
-    candidates: list[Path] = []
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
+    """Return the command prefix for the selected tmux-cli entrypoint.
+
+    Explicit configuration fails closed. Silently falling back to another
+    checkout after a typo in ``--tb`` or ``TMUX_CLI`` is surprising and can
+    run a different backend version than the operator intended.
+    """
+    if explicit is not None:
+        return _required_tb(explicit, "--tb")
     if configured := os.environ.get("TMUX_CLI"):
-        candidates.append(Path(configured).expanduser())
+        return _required_tb(configured, "TMUX_CLI")
 
     here = Path(__file__).resolve().parent
-    candidates.extend((
+    candidates = (
         here / "tmux-cli" / "tb.py",
         here.parent / "tmux-cli" / "tb.py",  # sibling developer checkout
-    ))
+    )
 
     for candidate in candidates:
-        if candidate.is_dir():
-            candidate = candidate / "tb.py"
-        if candidate.is_file():
-            if candidate.suffix == ".py" or not os.access(candidate, os.X_OK):
-                return [sys.executable, str(candidate)]
-            return [str(candidate)]
+        if command := _tb_command(candidate):
+            return command
 
     installed = shutil.which("tb")
     if installed:
@@ -72,6 +101,7 @@ class TmuxCLI:
 
     def __init__(self, command: Sequence[str]):
         self.command = list(command)
+        self._poll_extensions_supported: bool | None = None
 
     @classmethod
     def discover(cls, explicit: str | None = None) -> "TmuxCLI":
@@ -79,22 +109,31 @@ class TmuxCLI:
 
     @staticmethod
     def _decode_error(proc: subprocess.CompletedProcess[str]) -> BackendError:
-        text = (proc.stderr or proc.stdout or "").strip()
-        try:
-            envelope = json.loads(text)
-        except (TypeError, ValueError):
-            return BackendError(
-                text or f"tmux-cli exited with status {proc.returncode}",
-                exit_code=proc.returncode or 1,
-            )
-        if isinstance(envelope, dict):
-            return BackendError(
-                str(envelope.get("error") or "tmux-cli command failed"),
-                code=str(envelope.get("code") or "EUNKNOWN"),
-                exit_code=int(envelope.get("exit") or proc.returncode or 1),
-            )
+        texts = [
+            text.strip()
+            for text in (proc.stderr, proc.stdout)
+            if isinstance(text, str) and text.strip()
+        ]
+        for text in texts:
+            try:
+                envelope = json.loads(text)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(envelope, dict):
+                try:
+                    exit_code = int(
+                        envelope.get("exit") or proc.returncode or 1
+                    )
+                except (TypeError, ValueError):
+                    exit_code = proc.returncode or 1
+                return BackendError(
+                    str(envelope.get("error") or "tmux-cli command failed"),
+                    code=str(envelope.get("code") or "EUNKNOWN"),
+                    exit_code=exit_code,
+                )
+        text = texts[0] if texts else ""
         return BackendError(
-            text or "tmux-cli returned an invalid error",
+            text or f"tmux-cli exited with status {proc.returncode}",
             exit_code=proc.returncode or 1,
         )
 
@@ -106,6 +145,7 @@ class TmuxCLI:
                 [*self.command, "--json", *args],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=timeout,
                 env=env,
             )
@@ -123,34 +163,60 @@ class TmuxCLI:
             raise BackendError("tmux-cli returned an invalid success envelope", code="EPROTOCOL")
         return envelope.get("data")
 
-    def snapshot(self) -> dict[str, Any]:
-        data = self.json("snapshot")
+    def snapshot(
+        self,
+        *,
+        capture_target: str | None = None,
+        capture_lines: int = DEFAULT_PREVIEW_LINES,
+    ) -> dict[str, Any]:
+        if self._poll_extensions_supported is not False:
+            args = ["snapshot", "--tmux-only"]
+            if capture_target:
+                args.extend((
+                    f"--capture={capture_target}",
+                    "--lines", str(capture_lines),
+                ))
+            try:
+                data = self.json(*args, timeout=POLL_TIMEOUT)
+                self._poll_extensions_supported = True
+            except BackendError as error:
+                if error.code != "EUSAGE":
+                    raise
+                self._poll_extensions_supported = False
+                data = self.json("snapshot", timeout=POLL_TIMEOUT)
+        else:
+            data = self.json("snapshot", timeout=POLL_TIMEOUT)
         if not isinstance(data, dict):
             raise BackendError("snapshot payload is not an object", code="EPROTOCOL")
         return data
 
     def capture(self, target: str, lines: int) -> str:
-        data = self.json("capture", target, "--lines", str(lines))
+        data = self.json(
+            "capture", "--lines", str(lines), "--", target,
+            timeout=POLL_TIMEOUT,
+        )
         if not isinstance(data, dict) or not isinstance(data.get("content"), str):
             raise BackendError("capture payload is invalid", code="EPROTOCOL")
         return data["content"]
 
     def new(self, name: str) -> None:
-        self.json("new", name)
+        self.json("new", "--", name)
 
     def rename(self, old: str, new: str) -> None:
-        self.json("rename", old, new)
+        self.json("rename", "--", old, new)
 
     def kill(self, target: str) -> None:
-        self.json("kill", target, "--force")
+        self.json("kill", "--force", "--", target)
 
     def type_line(self, target: str, text: str) -> None:
-        self.json("type", target, text)
+        self.json("type", "--", target, text)
 
     def attach(self, target: str) -> int:
         """Attach in a child so detaching returns to the manager."""
         try:
-            return subprocess.run([*self.command, "attach", target]).returncode
+            return subprocess.run(
+                [*self.command, "attach", "--", target],
+            ).returncode
         except FileNotFoundError as error:
             raise BackendError(f"could not run tmux-cli: {error}", code="ENOCLI") from error
 
@@ -164,6 +230,12 @@ def as_int(value: object, default: int = 0) -> int:
 
 def pane_target(pane: dict[str, Any]) -> str:
     return f"{pane.get('session', '')}:{pane.get('window', '0')}.{pane.get('pane', '0')}"
+
+
+def pane_identity(pane: dict[str, Any]) -> str:
+    """Stable selection key, with a target fallback for older tmux-cli."""
+    stable_id = str(pane.get("pane_id") or "")
+    return stable_id or pane_target(pane)
 
 
 def sort_panes(panes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -200,15 +272,62 @@ def clean_preview(text: str) -> list[str]:
     return [CONTROL_RE.sub("�", line.expandtabs(4)) for line in text.splitlines()]
 
 
+def clean_inline(text: object) -> str:
+    return INLINE_CONTROL_RE.sub("�", ANSI_RE.sub("", str(text)))
+
+
+def display_width(text: object) -> int:
+    """Approximate terminal cells without adding a wcwidth dependency."""
+    width = 0
+    for char in clean_inline(text):
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+    return width
+
+
 def clip(text: object, width: int) -> str:
-    value = str(text)
+    value = clean_inline(text)
     if width <= 0:
         return ""
-    if len(value) <= width:
+    if display_width(value) <= width:
         return value
     if width == 1:
         return "…"
-    return value[: width - 1] + "…"
+    available = width - 1
+    used = 0
+    clipped: list[str] = []
+    for char in value:
+        char_width = 0 if unicodedata.combining(char) else (
+            2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+        )
+        if used + char_width > available:
+            break
+        clipped.append(char)
+        used += char_width
+    return "".join(clipped) + "…"
+
+
+def fit(text: object, width: int) -> str:
+    value = clip(text, width)
+    return value + " " * max(0, width - display_width(value))
+
+
+def input_view(value: Sequence[str], cursor: int, width: int) -> tuple[str, int]:
+    """Return a cell-bounded prompt slice and cursor column."""
+    if width <= 0:
+        return "", 0
+    cursor = max(0, min(cursor, len(value)))
+    start = 0
+    cursor_limit = max(0, width - 1)
+    while (
+        start < cursor
+        and display_width("".join(value[start:cursor])) > cursor_limit
+    ):
+        start += 1
+    before_cursor = "".join(value[start:cursor])
+    visible = clip("".join(value[start:]), width)
+    return visible, min(display_width(before_cursor), cursor_limit)
 
 
 @dataclass
@@ -338,10 +457,19 @@ class TmuxManager:
 
     def apply_filter(self, *, preserve_name: str | None = None) -> None:
         query = self.query.casefold()
-        self.filtered_sessions = [
-            session for session in self.sessions
-            if query in str(session.get("name", "")).casefold()
-        ]
+        self.filtered_sessions = []
+        for session in self.sessions:
+            name = str(session.get("name", ""))
+            searchable = [name]
+            for pane in self.panes.get(name, []):
+                searchable.extend((
+                    str(pane.get("window_name") or ""),
+                    str(pane.get("command") or ""),
+                    str(pane.get("cwd") or ""),
+                    pane_target(pane),
+                ))
+            if any(query in value.casefold() for value in searchable):
+                self.filtered_sessions.append(session)
         if preserve_name:
             for index, session in enumerate(self.filtered_sessions):
                 if session.get("name") == preserve_name:
@@ -362,13 +490,30 @@ class TmuxManager:
         self.message_until = time.monotonic() + seconds
 
     def refresh(self) -> None:
-        selected = self.current_session_name() or self.initial_session
+        # Explicit post-action/startup selection must win over the session
+        # that was current in the previous snapshot. Otherwise creating or
+        # renaming a session leaves the cursor on the old row.
+        selected = self.initial_session or self.current_session_name()
+        requested_preview = (
+            self.current_target() if self.preview_enabled else None
+        )
+        selected_panes: dict[str, str] = {}
+        old_indices = dict(self.pane_indices)
+        for name, panes in self.panes.items():
+            if not panes:
+                continue
+            index = max(0, min(old_indices.get(name, 0), len(panes) - 1))
+            selected_panes[name] = pane_identity(panes[index])
         try:
-            data = self.backend.snapshot()
+            data = self.backend.snapshot(
+                capture_target=requested_preview,
+                capture_lines=self.preview_lines,
+            )
         except BackendError as error:
             self.server_running = False
             self.set_message(error.message, "error", 6.0)
             self.last_refresh = time.monotonic()
+            self.force_refresh = False
             return
 
         raw_sessions = data.get("sessions", [])
@@ -389,16 +534,19 @@ class TmuxManager:
         self.apply_filter(preserve_name=selected)
         self.initial_session = None
 
-        live_names = {str(row.get("name")) for row in self.sessions}
-        self.pane_indices = {
-            name: index for name, index in self.pane_indices.items()
-            if name in live_names
-        }
+        self.pane_indices = {}
         for name, panes in self.panes.items():
-            self.pane_indices[name] = min(
-                self.pane_indices.get(name, 0), max(0, len(panes) - 1)
+            fallback = min(old_indices.get(name, 0), max(0, len(panes) - 1))
+            wanted = selected_panes.get(name)
+            self.pane_indices[name] = next(
+                (
+                    index
+                    for index, pane in enumerate(panes)
+                    if wanted is not None and pane_identity(pane) == wanted
+                ),
+                fallback,
             )
-        self._refresh_preview()
+        self._refresh_preview(data.get("capture"))
         if self.message_until < time.monotonic():
             count = len(self.sessions)
             self.message = f"{count} session{'s' if count != 1 else ''}"
@@ -406,11 +554,25 @@ class TmuxManager:
         self.last_refresh = time.monotonic()
         self.force_refresh = False
 
-    def _refresh_preview(self) -> None:
+    def _refresh_preview(self, prefetched: object = None) -> None:
         target = self.current_target()
         if not self.preview_enabled or not target:
             self.preview = []
             self.preview_target = target or ""
+            return
+        if (
+            isinstance(prefetched, dict)
+            and prefetched.get("target") == target
+        ):
+            error = str(prefetched.get("error") or "")
+            content = prefetched.get("content")
+            if error:
+                self.preview = [f"[preview unavailable: {error}]"]
+            elif isinstance(content, str):
+                self.preview = clean_preview(content)
+            else:
+                self.preview = ["[preview unavailable: invalid capture payload]"]
+            self.preview_target = target
             return
         try:
             self.preview = clean_preview(
@@ -425,8 +587,10 @@ class TmuxManager:
         height, screen_width = self.screen.getmaxyx()
         if y < 0 or y >= height or x < 0 or x >= screen_width or width <= 0:
             return
+        available = min(width, screen_width - x)
+        rendered = clip(text, available)
         try:
-            self.screen.addnstr(y, x, str(text), min(width, screen_width - x), attr)
+            self.screen.addstr(y, x, rendered, attr)
         except curses.error:
             pass
 
@@ -477,6 +641,7 @@ class TmuxManager:
         self.screen.erase()
         height, width = self.screen.getmaxyx()
         if height < 14 or width < 56:
+            self._layout = {}
             self.add(0, 0, " Tmux Manager ", width, self.palette.header)
             self.add(2, 2, "Terminal is too small.", width - 4, self.palette.error)
             self.add(4, 2, "Minimum: 56 columns × 14 rows", width - 4)
@@ -488,7 +653,14 @@ class TmuxManager:
         self.add(0, 2, "Tmux Manager", width - 4, self.palette.header)
         server = "online" if self.server_running else "idle"
         summary = f"{self.host or 'local'} · tmux {server}"
-        self.add(0, max(2, width - len(summary) - 2), summary, len(summary), self.palette.header)
+        summary_width = display_width(summary)
+        self.add(
+            0,
+            max(2, width - summary_width - 2),
+            summary,
+            summary_width,
+            self.palette.header,
+        )
 
         filter_text = f"filter: {self.query}" if self.query else "All sessions"
         self.add(1, 2, filter_text, width - 4, self.palette.dim)
@@ -546,7 +718,7 @@ class TmuxManager:
                 badge += f" {attached}a"
             badge += f" {idle}"
             available_name = max(1, width - len(badge) - 5)
-            line = f" {clip(name, available_name).ljust(available_name)} {badge}"
+            line = f" {fit(name, available_name)} {badge}"
             attr = (
                 self.palette.selected
                 if index == self.session_index
@@ -585,8 +757,11 @@ class TmuxManager:
             command = str(pane.get("command") or "?")
             window_name = str(pane.get("window_name") or "")
             cwd = str(pane.get("cwd") or "")
-            prefix = f" {marker} {target:<5} {clip(window_name, 12):<12} {clip(command, 12):<12} "
-            rest = max(0, width - len(prefix) - 2)
+            prefix = (
+                f" {marker} {fit(target, 5)} {fit(window_name, 12)} "
+                f"{fit(command, 12)} "
+            )
+            rest = max(0, width - display_width(prefix) - 2)
             line = prefix + clip(cwd, rest)
             selected = index == pane_index
             attr = (
@@ -600,8 +775,14 @@ class TmuxManager:
         preview_y = divider_y + 1
         preview_h = y + height - 1 - preview_y
         preview_label = f" Preview · {self.preview_target or title} "
-        self.add(divider_y, max(x + 2, x + width - len(preview_label) - 2),
-                 preview_label, width - 4, self.palette.dim)
+        preview_label_width = display_width(preview_label)
+        self.add(
+            divider_y,
+            max(x + 2, x + width - preview_label_width - 2),
+            preview_label,
+            width - 4,
+            self.palette.dim,
+        )
         if not self.preview_enabled:
             self.add(preview_y + 1, x + 2, "Preview disabled", width - 4, self.palette.dim)
             return
@@ -653,12 +834,12 @@ class TmuxManager:
             cursor = len(value)
             curses.curs_set(1)
             while True:
-                display = "".join(value)
                 window.addstr(2, 2, " " * (box_w - 4))
-                start = max(0, cursor - (box_w - 6))
-                visible = display[start:start + box_w - 4]
-                window.addnstr(2, 2, visible, box_w - 4)
-                window.move(2, 2 + min(cursor - start, box_w - 5))
+                visible, cursor_column = input_view(
+                    value, cursor, box_w - 4,
+                )
+                window.addstr(2, 2, visible)
+                window.move(2, 2 + cursor_column)
                 window.refresh()
                 key = window.get_wch()
                 if key in ("\n", "\r") or key == curses.KEY_ENTER:
@@ -728,7 +909,7 @@ class TmuxManager:
             ("  e             rename the selected session", self.palette.normal),
             ("  d             kill the selected session (confirmation required)", self.palette.normal),
             ("  s             type a command into the selected pane", self.palette.normal),
-            ("  /             filter sessions by name", self.palette.normal),
+            ("  /             filter sessions and pane details", self.palette.normal),
             ("  r             refresh now", self.palette.normal),
             ("  p             toggle the live preview", self.palette.normal),
             ("  q             quit", self.palette.normal),
@@ -752,6 +933,11 @@ class TmuxManager:
             pass
         self.screen.touchwin()
 
+    def select_after_refresh(self, name: str) -> None:
+        self.initial_session = name
+        self.query = ""
+        self.list_top = 0
+
     def create_session(self) -> None:
         name = self.prompt("New session name")
         if name is None:
@@ -761,7 +947,7 @@ class TmuxManager:
         except BackendError as error:
             self.set_message(error.message, "error", 6.0)
             return
-        self.initial_session = name
+        self.select_after_refresh(name)
         self.set_message(f"Created {name}", "good")
         self.force_refresh = True
 
@@ -778,7 +964,7 @@ class TmuxManager:
         except BackendError as error:
             self.set_message(error.message, "error", 6.0)
             return
-        self.initial_session = new
+        self.select_after_refresh(new)
         self.set_message(f"Renamed {old} → {new}", "good")
         self.force_refresh = True
 
@@ -815,7 +1001,7 @@ class TmuxManager:
         self.force_refresh = True
 
     def edit_filter(self) -> None:
-        query = self.prompt("Filter sessions", self.query, allow_empty=True)
+        query = self.prompt("Filter sessions and panes", self.query, allow_empty=True)
         if query is None:
             return
         self.query = query
@@ -991,8 +1177,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.refresh <= 0:
-        raise SystemExit("tmux-tui: --refresh must be positive")
+    if not math.isfinite(args.refresh) or args.refresh <= 0:
+        raise SystemExit("tmux-tui: --refresh must be a finite positive number")
     if args.preview_lines < 1:
         raise SystemExit("tmux-tui: --preview-lines must be positive")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
