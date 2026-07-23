@@ -1,0 +1,3 @@
+[submodule "tmux-cli"]
+	path = tmux-cli
+	url = https://github.com/itsmygithubacct/tmux-cli.git
