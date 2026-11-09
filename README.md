@@ -92,9 +92,10 @@ Command-line options: `--tb PATH`, `--refresh SECONDS` (default 1),
 dependencies. Each refresh runs the bundled `tmux-cli/tb.py` as a subprocess
 with `--json`: `snapshot --tmux-only` for sessions, windows and stable pane
 IDs (with the selected pane's preview when the tmux-cli supports it), then
-`new`, `rename`, `kill`, `type` and `attach` for actions. Because the manager
-only parses tb's versioned envelope, tmux behaviour, targeting rules and
-error codes are defined once, in tmux-cli.
+`new`, `rename`, `kill` and `type` for actions. `attach` runs `tb attach` in
+the foreground without `--json`, so detaching returns to the manager. Because
+the manager only parses tb's versioned envelope, tmux behaviour, targeting
+rules and error codes are defined once, in tmux-cli.
 
 ```
 tmux-tui (curses)  --subprocess, --json-->  tmux-cli/tb.py  --> tmux server
