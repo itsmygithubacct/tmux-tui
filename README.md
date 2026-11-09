@@ -7,6 +7,12 @@ The UI does not implement a second tmux control layer. Every read and mutation
 goes through the bundled [`tmux-cli`](https://github.com/itsmygithubacct/tmux-cli)
 submodule and its stable `tb --json` contract.
 
+**Status:** ships in Plebian-OS 0.2.3. Kilix pins this repository and its
+tmux-cli submodule by commit in `scripts/install-tmux-tui.sh`; Pleb runs
+`kilix tmux --install-only --with-tb` at first boot, and the Kilix content
+catalog lists it as **Tmux Sessions** (`kilix-tmux-manager`, a system entry
+that runs `kilix tmux`).
+
 ## Features
 
 - session list with window, client, and idle indicators
@@ -76,6 +82,24 @@ Pleb and Plebian-OS install both commands. Standalone Kilix downloads the
 pinned source closure on first `kilix tmux` launch; `kilix tmux --with-tb`
 also installs the `tb` alias.
 
+Command-line options: `--tb PATH`, `--refresh SECONDS` (default 1),
+`--preview-lines N` (default 80), `--no-preview`, `--session NAME` and
+`--version`.
+
+## How it works
+
+`tmux_tui.py` is a single curses program with no Python package
+dependencies. Each refresh runs the bundled `tmux-cli/tb.py` as a subprocess
+with `--json`: `snapshot --tmux-only` for sessions, windows and stable pane
+IDs (with the selected pane's preview when the tmux-cli supports it), then
+`new`, `rename`, `kill`, `type` and `attach` for actions. Because the manager
+only parses tb's versioned envelope, tmux behaviour, targeting rules and
+error codes are defined once, in tmux-cli.
+
+```
+tmux-tui (curses)  --subprocess, --json-->  tmux-cli/tb.py  --> tmux server
+```
+
 ## Test
 
 ```bash
@@ -84,6 +108,25 @@ make check
 
 `make check` runs the unit and installer-safety tests, compiles the entrypoint,
 and verifies that the source and `VERSION` file agree.
+
+## Related repositories
+
+- [tmux-cli](https://github.com/itsmygithubacct/tmux-cli#readme) — the `tb` CLI this manager drives (submodule)
+- [tmux-browse](https://github.com/itsmygithubacct/tmux-browse#readme) — the same CLI core as a web dashboard
+- [kilix](https://github.com/itsmygithubacct/kilix#readme) — `kilix tmux` installs and launches this manager at a pinned commit
+- [pleb](https://github.com/itsmygithubacct/pleb#readme) — installs it at first boot
+- [kilix-content](https://github.com/itsmygithubacct/kilix-content#readme) — the catalog entry `kilix-tmux-manager`
+
+## Part of Plebian-OS
+
+tmux-tui is one of the repositories behind
+[Plebian-OS](https://github.com/itsmygithubacct/plebian-os#readme), a Debian
+install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme)
+running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
+desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
+It is installed for the desktop user at first boot and opened by `kilix tmux`.
+The map of every repository and how it ships is on the
+[components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
 ## License
 
