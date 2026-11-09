@@ -13,6 +13,8 @@ tmux-cli submodule by commit in `scripts/install-tmux-tui.sh`; Pleb runs
 catalog lists it as **Tmux Sessions** (`kilix-tmux-manager`, a system entry
 that runs `kilix tmux`).
 
+![Tmux Manager listing three sessions, with the selected session's pane previewed](docs/images/tmux-tui.png)
+
 ## Features
 
 - session list with window, client, and idle indicators
