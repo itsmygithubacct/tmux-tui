@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+# The UI discovers tb on PATH when no checkout sits beside it. The package
+# copies only this program. make install keeps linking a developer checkout.
+
+D := debian/tmux-tui/usr/share/tmux-tui
+
+%:
+	dh $@
+
+override_dh_auto_build:
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -d $(D)
+	install -m 0755 tmux_tui.py $(D)/tmux_tui.py

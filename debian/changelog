@@ -1,0 +1,7 @@
+tmux-tui (0.2.0+packaging1) UNRELEASED; urgency=medium
+
+  * Install the terminal UI under /usr/share/tmux-tui, with /usr/bin/tmux-tui
+    linked to that copy. It uses the packaged tb command. Developer installs
+    still link a checkout.
+
+ -- itsmygithubacct <itsmygithubacct@users.noreply.github.com>  Fri, 20 Nov 2026 06:02:10 +0000

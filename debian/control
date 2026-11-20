@@ -1,0 +1,20 @@
+Source: tmux-tui
+Section: utils
+Priority: optional
+Maintainer: itsmygithubacct <itsmygithubacct@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.2
+Homepage: https://github.com/itsmygithubacct/tmux-tui
+Vcs-Git: https://github.com/itsmygithubacct/tmux-tui.git
+Vcs-Browser: https://github.com/itsmygithubacct/tmux-tui
+Rules-Requires-Root: no
+
+Package: tmux-tui
+Architecture: all
+Depends: python3, tmux, tmux-cli, ${misc:Depends}
+Description: terminal UI for tmux sessions
+ tmux-tui is a curses interface for tmux sessions. It talks to tmux through
+ the tb command from tmux-cli.
+ .
+ This package installs the program under /usr/share/tmux-tui and links
+ /usr/bin/tmux-tui to it.
